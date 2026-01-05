@@ -393,6 +393,97 @@ class OpTermJAX:
         return cls(opstr=aux_data, strength=strength, indices=indices)
 
 
+@jax.jit
+def _get_Olocx_ref(
+    psi1: PsiArray,
+    psi_ref: PsiArray,
+    segment: jax.Array,
+    psi2_conn: PsiArray,
+    H_conn: jax.Array,
+) -> jax.Array:
+    """Local estimator with reference-state denominator."""
+    ndevices = jax.device_count()
+    psi1 = psi1.reshape(ndevices, -1)
+    psi_ref = psi_ref.reshape(ndevices, -1)
+    psi2_conn = psi2_conn.reshape(ndevices, -1)
+    H_conn = H_conn.reshape(ndevices, -1)
+    segment = segment.reshape(ndevices, -1)
+    num_seg = psi1.shape[1]
+
+    fn_ratio = lambda psi1, psi_ref, psi2_conn, segment: jnp.asarray(
+        psi2_conn * psi1[segment] / (psi_ref[segment] ** 2)
+    )
+    psi_ratio = jax.vmap(fn_ratio)(psi1, psi_ref, psi2_conn, segment)
+
+    segment_sum = lambda data, segment: jax.ops.segment_sum(data, segment, num_seg)
+    Olocx = jax.vmap(segment_sum)(psi_ratio * H_conn, segment)
+    return Olocx.flatten()
+
+@jax.jit
+def _get_Olocx_ref_matrix(
+    psi1,        # (B, N, K)
+    psi_ref,     # (B,)
+    segment,     # (D,)  !!! device-local within each chunk !!!
+    psi2_conn,   # (D, N, K)
+    H_conn,      # (D,)
+):
+    """
+    Output:
+      out: (B, N, K, N, K)
+
+    Assumptions (same as your original code pattern):
+      - B % ndevices == 0 and D % ndevices == 0
+      - segment is chunked the same way as psi2_conn/H_conn over D
+      - within each device chunk, segment values are in [0, B_loc)
+        (i.e., segment is *local* indices, not global 0..B-1)
+    """
+    ndev = jax.device_count()
+    B, N, K = psi1.shape
+    D = psi2_conn.shape[0]
+
+    # Must be evenly split across devices for the reshape trick
+    B_loc = B // ndev
+    D_loc = D // ndev
+    # If you want hard errors instead of silent reshape bugs:
+    assert B_loc * ndev == B, "B must be divisible by ndevices"
+    assert D_loc * ndev == D, "D must be divisible by ndevices"
+
+    # ---- reshape into explicit device axis ----
+    psi1_d   = psi1.reshape(ndev, B_loc, N, K)        # (ndev, B_loc, N, K)
+    pref_d   = psi_ref.reshape(ndev, B_loc)           # (ndev, B_loc)
+    seg_d    = segment.reshape(ndev, D_loc)           # (ndev, D_loc)
+    psi2_d   = psi2_conn.reshape(ndev, D_loc, N, K)   # (ndev, D_loc, N, K)
+    H_d      = H_conn.reshape(ndev, D_loc)            # (ndev, D_loc)
+
+    # ---- per-device computation: returns (B_loc, N, K, N, K) ----
+    def per_dev(p1, pref, seg, p2, h):
+        # R[d,m,q] = psi2[d,m,q] * H[d]
+        R = p2 * h[:, None, None]                     # (D_loc, N, K)
+
+        # segment_sum over d -> b, for each (m,q):
+        # Rsum[b,m,q] = sum_{d: seg[d]=b} R[d,m,q]
+        R_flat = R.reshape(D_loc, -1).T               # (N*K, D_loc)
+
+        def segsum_1(x_mq):
+            return jax.ops.segment_sum(x_mq, seg, num_segments=B_loc)  # (B_loc,)
+
+        Rsum_flat = jax.vmap(segsum_1, in_axes=0)(R_flat)             # (N*K, B_loc)
+        Rsum = Rsum_flat.T.reshape(B_loc, N, K)                       # (B_loc, N, K)
+
+        # left factor: L[b,n,k] = psi1[b,n,k] / psi_ref[b]^2
+        L = p1 / (pref[:, None, None] ** 2)                           # (B_loc, N, K)
+
+        # out[b,n,k,m,q] = Rum[b,n,k] * L[b,m,q]
+        return jnp.einsum("bnk,bmq->bnkmq", Rsum, L)                   # (B_loc, N, K, N, K)
+
+    out_d = jax.vmap(per_dev, in_axes=(0, 0, 0, 0, 0))(psi1_d, pref_d, seg_d, psi2_d, H_d)
+    # out_d: (ndev, N, K, N, K)
+
+    # ---- merge device axis back to global B ----
+    out = out_d.reshape(B_loc, N, K, N, K)
+    return out
+
+
 class Operator:
     """Quantum operator"""
 
@@ -826,6 +917,227 @@ class Operator:
         self, state: State, samples: Samples | jax.Array, return_var: Literal[True]
     ) -> tuple[complex, float]: ...
 
+    def Oloc_transition(
+        self, state1: State, state2: State, samples: Union[Samples, np.ndarray, jax.Array]
+    ) -> jax.Array:
+        r"""
+        Computes the transition local operator for :math:`\left< \psi_2 | O | \psi_1 \right>`
+        :math:`O_\mathrm{loc}^{(2,1)}(s) = \sum_{s'} \frac{\psi_2(s')}{\psi_1(s)} \left< s|O|s' \right>`
+
+        :param state1:
+            The right state :math:`\psi_1` for computing connected states
+
+        :param state2:
+            The left state :math:`\psi_2` for computing the ratio
+
+        :param samples:
+            A batch of samples :math:`s`, should be sampled from :math:`|\psi_1|^2`
+
+        :return:
+            A 1D jax array :math:`O_\mathrm{loc}^{(2,1)}(s)`
+        """
+        forward_chunk = state1.forward_chunk if hasattr(state1, "forward_chunk") else None
+        ref_chunk = state1.ref_chunk if hasattr(state1, "ref_chunk") else None
+        if (
+            forward_chunk is not None
+            and ref_chunk is not None
+            and forward_chunk < ref_chunk
+        ):
+            raise ValueError("Unsupported chunk size: forward_chunk < ref_chunk.")
+
+        if isinstance(samples, Samples):
+            s = samples.spins
+            psi1 = samples.psi.conj()  # samples assumed to come from state1
+            internal1 = samples.state_internal
+        else:
+            s = to_distribute_array(samples)
+            psi1 = state1(s).conj()
+            internal1 = None
+
+        psi2 = state2(s).conj()
+        internal2 = None
+
+        # Diagonal contribution: <s|O|s> * psi2(s) / psi1(s)
+        Oloc = self.apply_diag(s) * (psi2 / psi1)
+        off_diags = self.apply_off_diag(s)
+        self._update_connectivity(off_diags)
+
+        for nflips, (s_conn, H_conn) in off_diags.items():
+            conn_size = _get_conn_size(H_conn, forward_chunk).item()
+
+            def get_Oloc_terms(s, psi1, s_conn, H_conn, internal1, internal2):
+                segment, s_conn, H_conn = _get_conn(s_conn, H_conn, conn_size)
+                if internal1 is None:
+                    internal1 = state1.init_internal(s)
+                if internal2 is None:
+                    internal2 = state2.init_internal(s)
+                psi2_conn = state2.ref_forward(s_conn, s, nflips, segment, internal2).conj()
+                return _get_Olocx(psi1, segment, psi2_conn, H_conn)
+
+            if internal1 is None and internal2 is None:
+                in_axes = (0, 0, 0, 0, None, None)
+            elif internal1 is None:
+                in_axes = (0, 0, 0, 0, None, 0)
+            elif internal2 is None:
+                in_axes = (0, 0, 0, 0, 0, None)
+            else:
+                in_axes = 0
+
+            get_Oloc_terms = chunk_map(get_Oloc_terms, in_axes, chunk_size=ref_chunk)
+            Oloc += get_Oloc_terms(s, psi1, s_conn, H_conn, internal1, internal2)
+
+        return Oloc
+    
+    def Oloc_transition_withref(
+        self, state_ref: State, state1: State, state2: State, samples: Union[Samples, np.ndarray, jax.Array]
+    ) -> jax.Array:
+        r"""
+        Computes the transition local operator for :math:`\left< \psi_2 | O | \psi_1 \right>`
+        with sampling drawn from :math:`\psi_\mathrm{ref}`:
+        :math:`O_\mathrm{loc}^{(2,1)}(s) = \sum_{s'} H_{s', s} \psi_2(s') \psi_1(s) / \psi_\mathrm{ref}(s)^2`
+
+        :param state_ref:
+            The reference state for sampling
+        :param state1:
+            The right state :math:`\psi_1` for computing connected states
+
+        :param state2:
+            The left state :math:`\psi_2` for computing the ratio
+
+        :param samples:
+            A batch of samples :math:`s`, sampled from :math:`|\psi_\mathrm{ref}|^2`
+
+        :return:
+            A 1D jax array :math:`O_\mathrm{loc}^{(2,1)}(s)`
+        """
+        forward_chunk = state1.forward_chunk if hasattr(state1, "forward_chunk") else None
+        ref_chunk = state1.ref_chunk if hasattr(state1, "ref_chunk") else None
+        if (
+            forward_chunk is not None
+            and ref_chunk is not None
+            and forward_chunk < ref_chunk
+        ):
+            raise ValueError("Unsupported chunk size: forward_chunk < ref_chunk.")
+
+        if isinstance(samples, Samples):
+            s = samples.spins
+            psi_ref = samples.psi.conj()  # samples assumed to come from state_ref
+        else:
+            s = to_distribute_array(samples)
+            psi_ref = state_ref(s).conj()
+
+        psi1 = state1(s).conj()
+        psi2 = state2(s).conj()
+        internal1 = None
+        internal2 = None
+
+        # Diagonal contribution: <s|O|s> * psi2(s) * psi1(s) / psi_ref(s)^2
+        Oloc = self.apply_diag(s) * psi2 * psi1 / (psi_ref ** 2)
+        off_diags = self.apply_off_diag(s)
+        self._update_connectivity(off_diags)
+
+        for nflips, (s_conn, H_conn) in off_diags.items():
+            conn_size = _get_conn_size(H_conn, forward_chunk).item()
+
+            def get_Oloc_terms(s, psi1, psi_ref, s_conn, H_conn, internal1, internal2):
+                segment, s_conn, H_conn = _get_conn(s_conn, H_conn, conn_size)
+                if internal1 is None:
+                    internal1 = state1.init_internal(s)
+                if internal2 is None:
+                    internal2 = state2.init_internal(s)
+                psi2_conn = state2.ref_forward(s_conn, s, nflips, segment, internal2).conj()
+                return _get_Olocx_ref(psi1, psi_ref, segment, psi2_conn, H_conn)
+
+            if internal1 is None and internal2 is None:
+                in_axes = (0, 0, 0, 0, 0, None, None)
+            elif internal1 is None:
+                in_axes = (0, 0, 0, 0, 0, None, 0)
+            elif internal2 is None:
+                in_axes = (0, 0, 0, 0, 0, 0, None)
+            else:
+                in_axes = 0
+
+            get_Oloc_terms = chunk_map(get_Oloc_terms, in_axes, chunk_size=ref_chunk)
+            Oloc += get_Oloc_terms(s, psi1, psi_ref, s_conn, H_conn, internal1, internal2)
+
+        return Oloc
+    
+    def Oloc_transition_matrix_withref(
+        self, state_ref: State, state: State, samples: Union[Samples, np.ndarray, jax.Array]
+    ) -> jax.Array:
+        r"""
+        Computes the transition local operator for :math:`\left< \psi_2 | O | \psi_1 \right>`
+        with sampling drawn from :math:`\psi_\mathrm{ref}`:
+        :math:`O_\mathrm{loc}^{(2,1)}(s) = \sum_{s'} H_{s', s} \psi_2(s') \psi_1(s) / \psi_\mathrm{ref}(s)^2`
+
+        :param state_ref:
+            The reference state for sampling
+        :param state1:
+            The right state :math:`\psi_1` for computing connected states
+
+        :param state2:
+            The left state :math:`\psi_2` for computing the ratio
+
+        :param samples:
+            A batch of samples :math:`s`, sampled from :math:`|\psi_\mathrm{ref}|^2`
+
+        :return:
+            A 1D jax array :math:`O_\mathrm{loc}^{(2,1)}(s)`
+        """
+        forward_chunk = state_ref.forward_chunk if hasattr(state_ref, "forward_chunk") else None
+        ref_chunk = state_ref.ref_chunk if hasattr(state_ref, "ref_chunk") else None
+        if (
+            forward_chunk is not None
+            and ref_chunk is not None
+            and forward_chunk < ref_chunk
+        ):
+            raise ValueError("Unsupported chunk size: forward_chunk < ref_chunk.")
+
+        if isinstance(samples, Samples):
+            s = samples.spins
+            psi_ref = samples.psi.conj()  # samples assumed to come from state_ref
+        else:
+            s = to_distribute_array(samples)
+            psi_ref = state_ref(s).conj()
+
+        internal1 = None
+        internal2 = None
+        psi = state(s) 
+
+        # Diagonal contribution: <s|O|s> * psi2(s) * psi1(s) / psi_ref(s)^2
+        Oloc = jnp.einsum("a,ani,amj,a->nimj", self.apply_diag(s), psi, psi, 1 / (psi_ref ** 2))/len(samples.psi)
+        
+        # * psi2 * psi1 / (psi_ref ** 2)
+        off_diags = self.apply_off_diag(s)
+        self._update_connectivity(off_diags)
+
+        for nflips, (s_conn, H_conn) in off_diags.items():
+            conn_size = _get_conn_size(H_conn, forward_chunk).item()
+
+            def get_Oloc_terms(s, psi, psi_ref, s_conn, H_conn, internal1, internal2):
+                segment, s_conn, H_conn = _get_conn(s_conn, H_conn, conn_size)
+                if internal1 is None:
+                    internal1 = state.init_internal(s)
+                if internal2 is None:
+                    internal2 = state.init_internal(s)
+                # psi2_conn = state.ref_forward(s_conn, s, nflips, segment, internal2).conj()
+                psi_conn = state.ref_forward(s_conn, s, nflips, segment, internal2)
+                return _get_Olocx_ref_matrix(psi, psi_ref, segment, psi_conn, H_conn)
+
+            if internal1 is None and internal2 is None:
+                in_axes = (0, 0, 0, 0, 0, None, None)
+            elif internal1 is None:
+                in_axes = (0, 0, 0, 0, 0, None, 0)
+            elif internal2 is None:
+                in_axes = (0, 0, 0, 0, 0, 0, None)
+            else:
+                in_axes = 0
+
+            get_Oloc_terms = chunk_map(get_Oloc_terms, in_axes, chunk_size=ref_chunk)
+            Oloc += jnp.mean(get_Oloc_terms(s, psi, psi_ref, s_conn, H_conn, internal1, internal2), axis=0)
+
+        return Oloc
+
     def expectation(
         self, state: State, samples: Samples | jax.Array, return_var: bool = False
     ) -> complex | tuple[complex, float]:
@@ -864,3 +1176,111 @@ class Operator:
             return Omean.item(), Ovar.real.item()
         else:
             return Omean.item()
+
+    def transition_element(
+        self, state1: State, state2: State, samples: Union[Samples, PsiArray], return_var: bool = False
+    ) -> Union[float, Tuple[float, float]]:
+        r"""
+        The transition matrix element between two different states
+        :math:`\left< \psi_2 | O | \psi_1 \right>`
+
+        :param state1:
+            The right state :math:`\psi_1` for computing :math:`O_\mathrm{loc}`
+
+        :param state2:
+            The left state :math:`\psi_2` for computing the ratio :math:`\psi_2/\psi_1`
+
+        :param samples:
+            The samples for estimating the matrix element.
+            Should be sampled from :math:`|\psi_1|^2`
+
+        :param return_var:
+            Whether the variance should also be returned, default to False
+
+        :return:
+            Omean:
+                Mean value of the transition matrix element
+                :math:`\left< \psi_2 | O | \psi_1 \right>`
+
+            Ovar:
+                Variance of the estimator, only returned when ``return_var = True``
+        """
+        reweight = samples.reweight_factor if isinstance(samples, Samples) else 1.0
+        Oloc = self.Oloc_transition(state1, state2, samples)
+        Omean = jnp.mean(Oloc * reweight)
+        if return_var:
+            Ovar = jnp.mean(jnp.abs(Oloc) ** 2 * reweight) - jnp.abs(Omean) ** 2
+            return Omean.item(), Ovar.real.item()
+        else:
+            return Omean.item()
+
+    def transition_element_withref(
+        self,
+        state_ref: State,
+        state1: State,
+        state2: State,
+        samples: Union[Samples, PsiArray],
+        return_var: bool = False,
+    ) -> Union[float, Tuple[float, float]]:
+        r"""
+        Transition matrix element :math:`\left< \psi_2 | O | \psi_1 \right>` estimated
+        with samples drawn from :math:`|\psi_\mathrm{ref}|^2`.
+
+        :param state_ref:
+            Reference state used for sampling.
+        :param state1:
+            The right state :math:`\psi_1` for computing connected states.
+        :param state2:
+            The left state :math:`\psi_2` for the ratio contribution.
+        :param samples:
+            Samples drawn from :math:`|\psi_\mathrm{ref}|^2`.
+        :param return_var:
+            Whether to also return the variance of the estimator.
+        :return:
+            Mean (and optionally variance) of the transition estimator.
+        """
+        reweight = samples.reweight_factor if isinstance(samples, Samples) else 1.0
+        Oloc = self.Oloc_transition_withref(state_ref, state1, state2, samples)
+        Omean = jnp.mean(Oloc * reweight)
+        if return_var:
+            Ovar = jnp.mean(jnp.abs(Oloc) ** 2 * reweight) - jnp.abs(Omean) ** 2
+            return Omean.item(), Ovar.real.item()
+        else:
+            return Omean.item()
+        
+    def transition_matrix_withref(
+        self,
+        state_ref: State,
+        state: State,
+        samples: Union[Samples, PsiArray],
+        return_var: bool = False,
+    ) -> Union[float, Tuple[float, float]]:
+        r"""
+        Transition matrix element :math:`\left< \psi_2 | O | \psi_1 \right>` estimated
+        with samples drawn from :math:`|\psi_\mathrm{ref}|^2`.
+
+        :param state_ref:
+            Reference state used for sampling.
+        :param state1:
+            The right state :math:`\psi_1` for computing connected states.
+        :param state2:
+            The left state :math:`\psi_2` for the ratio contribution.
+        :param samples:
+            Samples drawn from :math:`|\psi_\mathrm{ref}|^2`.
+        :param return_var:
+            Whether to also return the variance of the estimator.
+        :return:
+            Mean (and optionally variance) of the transition estimator.
+        """
+        reweight = samples.reweight_factor if isinstance(samples, Samples) else 1.0
+        Oloc = self.Oloc_transition_matrix_withref(state_ref, state, samples)
+        # w = reweight.reshape(-1, 1, 1, 1, 1)
+        return Oloc
+
+        # Omean = jnp.mean(Oloc * w, axis=0)
+
+        # if return_var:
+        #     Ovar = jnp.mean(jnp.abs(Oloc)**2 * w, axis=0) - jnp.abs(Omean)**2
+        #     return Omean, Ovar.real
+        # else:
+        #     return Omean
