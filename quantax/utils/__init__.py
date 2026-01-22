@@ -26,5 +26,5 @@ from .tree import (
     apply_updates,
 )
 from .big_array import LogArray, ScaleArray, PsiArray, where, isnan, isinf, isfinite
-from .function import shmap, chunk_map, jit_chunk_vmap
+from .function import shmap, chunk_map, jit_chunk_vmap, chunk_sum
 from .basis import ints_to_array, array_to_ints, neel, stripe, Sqz_factor, rand_states

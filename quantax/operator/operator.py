@@ -27,6 +27,7 @@ from ..utils import (
     to_distributed_array,
     to_replicated_numpy,
     chunk_map,
+    chunk_sum,
     PsiArray,
 )
 from ..global_defs import PARTICLE_TYPE, get_sites, get_default_dtype
@@ -421,10 +422,10 @@ def _get_Olocx_ref(
 
 @jax.jit
 def _get_Olocx_ref_matrix(
-    psi1,        # (B, N, K)
+    psi,        # (B, N, K)
     psi_ref,     # (B,)
     segment,     # (D,)  !!! device-local within each chunk !!!
-    psi2_conn,   # (D, N, K)
+    psi_conn,   # (D, N, K)
     H_conn,      # (D,)
 ):
     """
@@ -438,8 +439,8 @@ def _get_Olocx_ref_matrix(
         (i.e., segment is *local* indices, not global 0..B-1)
     """
     ndev = jax.device_count()
-    B, N, K = psi1.shape
-    D = psi2_conn.shape[0]
+    B, N, K = psi.shape
+    D = psi_conn.shape[0]
 
     # Must be evenly split across devices for the reshape trick
     B_loc = B // ndev
@@ -449,38 +450,37 @@ def _get_Olocx_ref_matrix(
     assert D_loc * ndev == D, "D must be divisible by ndevices"
 
     # ---- reshape into explicit device axis ----
-    psi1_d   = psi1.reshape(ndev, B_loc, N, K)        # (ndev, B_loc, N, K)
+    psi_d   = psi.reshape(ndev, B_loc, N, K)        # (ndev, B_loc, N, K)
     pref_d   = psi_ref.reshape(ndev, B_loc)           # (ndev, B_loc)
     seg_d    = segment.reshape(ndev, D_loc)           # (ndev, D_loc)
-    psi2_d   = psi2_conn.reshape(ndev, D_loc, N, K)   # (ndev, D_loc, N, K)
+    psi_conn_d   = psi_conn.reshape(ndev, D_loc, N, K)   # (ndev, D_loc, N, K)
     H_d      = H_conn.reshape(ndev, D_loc)            # (ndev, D_loc)
+
 
     # ---- per-device computation: returns (B_loc, N, K, N, K) ----
     def per_dev(p1, pref, seg, p2, h):
-        # R[d,m,q] = psi2[d,m,q] * H[d]
-        R = p2 * h[:, None, None]                     # (D_loc, N, K)
+        # L[d,m,q] = psi2[d,m,q] * H[d]
+        L = p2 * h[:, None, None] / (pref[seg, None, None] ** 2)   # (D_loc, N, K)
 
         # segment_sum over d -> b, for each (m,q):
-        # Rsum[b,m,q] = sum_{d: seg[d]=b} R[d,m,q]
-        R_flat = R.reshape(D_loc, -1).T               # (N*K, D_loc)
+        # Lsum[b,m,q] = sum_{d: seg[d]=b} L[d,m,q]
+        Lsum = jax.ops.segment_sum(L, seg, num_segments=B_loc)  # (B_loc, N*K)
+        Lsum = Lsum.reshape(B_loc, N, K)                       # (B_loc, N, K)
 
-        def segsum_1(x_mq):
-            return jax.ops.segment_sum(x_mq, seg, num_segments=B_loc)  # (B_loc,)
+        # Right factor: R[b,n,k] = psi1[b,n,k] / psi_ref[b]^2
+        # R = p1[:] #/ (pref[:, None, None] ** 2)                           # (B_loc, N, K)
+        # Rsum = jax.ops.segment_sum(R, seg, num_segments=B_loc)  # (B_loc, N, K)
+        # Rsum = Rsum.reshape(B_loc, N, K)                       # (B_loc, N, K)
+        
+        # out[b,n,k,m,q] = Lsum[b,n,k] * R[b,m,q]
+        return jnp.einsum("bnk,bmq->nkmq", Lsum, p1) #(N, K, N, K)
 
-        Rsum_flat = jax.vmap(segsum_1, in_axes=0)(R_flat)             # (N*K, B_loc)
-        Rsum = Rsum_flat.T.reshape(B_loc, N, K)                       # (B_loc, N, K)
-
-        # left factor: L[b,n,k] = psi1[b,n,k] / psi_ref[b]^2
-        L = p1 / (pref[:, None, None] ** 2)                           # (B_loc, N, K)
-
-        # out[b,n,k,m,q] = Rum[b,n,k] * L[b,m,q]
-        return jnp.einsum("bnk,bmq->bnkmq", Rsum, L)                   # (B_loc, N, K, N, K)
-
-    out_d = jax.vmap(per_dev, in_axes=(0, 0, 0, 0, 0))(psi1_d, pref_d, seg_d, psi2_d, H_d)
+    out_d = jax.vmap(per_dev, in_axes=(0, 0, 0, 0, 0))(psi_d, pref_d, seg_d, psi_conn_d, H_d)
     # out_d: (ndev, N, K, N, K)
 
-    # ---- merge device axis back to global B ----
-    out = out_d.reshape(B_loc, N, K, N, K)
+    # ---- merge device axis back ----
+    # ---- final output shape: (device, N, K, N, K) ----
+    out = out_d.sum(axis=0).reshape(N, K, N, K)  # (N, K, N, K)
     return out
 
 
@@ -1084,8 +1084,8 @@ class Operator:
         :return:
             A 1D jax array :math:`O_\mathrm{loc}^{(2,1)}(s)`
         """
-        forward_chunk = state_ref.forward_chunk if hasattr(state_ref, "forward_chunk") else None
-        ref_chunk = state_ref.ref_chunk if hasattr(state_ref, "ref_chunk") else None
+        forward_chunk = state.forward_chunk if hasattr(state, "forward_chunk") else None
+        ref_chunk = state.ref_chunk if hasattr(state, "ref_chunk") else None
         if (
             forward_chunk is not None
             and ref_chunk is not None
@@ -1093,19 +1093,20 @@ class Operator:
         ):
             raise ValueError("Unsupported chunk size: forward_chunk < ref_chunk.")
 
+
         if isinstance(samples, Samples):
             s = samples.spins
-            psi_ref = samples.psi.conj()  # samples assumed to come from state_ref
+            psi_ref = samples.psi  # samples assumed to come from state_ref
+            internal = samples.state_internal
         else:
             s = to_distribute_array(samples)
-            psi_ref = state_ref(s).conj()
-
-        internal1 = None
-        internal2 = None
+            psi_ref = state_ref(s)
+            internal = None
         psi = state(s) 
 
+
         # Diagonal contribution: <s|O|s> * psi2(s) * psi1(s) / psi_ref(s)^2
-        Oloc = jnp.einsum("a,ani,amj,a->nimj", self.apply_diag(s), psi, psi, 1 / (psi_ref ** 2))/len(samples.psi)
+        Oloc = jnp.einsum("a,ani,amj,a->nimj", self.apply_diag(s), psi, psi, 1 / (psi_ref ** 2))/samples.nsamples
         
         # * psi2 * psi1 / (psi_ref ** 2)
         off_diags = self.apply_off_diag(s)
@@ -1114,28 +1115,24 @@ class Operator:
         for nflips, (s_conn, H_conn) in off_diags.items():
             conn_size = _get_conn_size(H_conn, forward_chunk).item()
 
-            def get_Oloc_terms(s, psi, psi_ref, s_conn, H_conn, internal1, internal2):
+            def get_Oloc_terms(s, psi, psi_ref, s_conn, H_conn, internal):
                 segment, s_conn, H_conn = _get_conn(s_conn, H_conn, conn_size)
-                if internal1 is None:
-                    internal1 = state.init_internal(s)
-                if internal2 is None:
-                    internal2 = state.init_internal(s)
+                if internal is None:
+                    internal = state.init_internal(s)
+                # print("segment.shape after _get_conn", segment.shape)
                 # psi2_conn = state.ref_forward(s_conn, s, nflips, segment, internal2).conj()
-                psi_conn = state.ref_forward(s_conn, s, nflips, segment, internal2)
+                psi_conn = state.ref_forward(s_conn, s, nflips, segment, internal)
                 return _get_Olocx_ref_matrix(psi, psi_ref, segment, psi_conn, H_conn)
 
-            if internal1 is None and internal2 is None:
-                in_axes = (0, 0, 0, 0, 0, None, None)
-            elif internal1 is None:
-                in_axes = (0, 0, 0, 0, 0, None, 0)
-            elif internal2 is None:
-                in_axes = (0, 0, 0, 0, 0, 0, None)
+            if internal is None:
+                in_axes = (0, 0, 0, 0, 0, None)
             else:
                 in_axes = 0
 
-            get_Oloc_terms = chunk_map(get_Oloc_terms, in_axes, chunk_size=ref_chunk)
-            Oloc += jnp.mean(get_Oloc_terms(s, psi, psi_ref, s_conn, H_conn, internal1, internal2), axis=0)
-
+            # Reshape to device and vmap 
+            # for loop for the chunk
+            get_Oloc_terms = chunk_sum(get_Oloc_terms, in_axes, out_axes=0, chunk_size=ref_chunk)
+            Oloc += (get_Oloc_terms(s, psi, psi_ref, s_conn, H_conn, internal) / samples.nsamples)
         return Oloc
 
     def expectation(

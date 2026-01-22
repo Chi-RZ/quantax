@@ -263,6 +263,88 @@ def chunk_map(
 
     return chunked_f
 
+def chunk_sum(
+    f: Callable,
+    in_axes: tuple | int | None = 0,
+    out_axes: tuple | int | None = 0,
+    chunk_size: int | None = None,
+    use_scan: bool = False,
+) -> Callable:
+    """
+    Convert a vmapped function to a function with chunked batches and parallel
+    computation on all available machines. The arguments will be unchanged if the batch
+    size on each machine is smaller than the chunk size, but it will be padded with 0
+    if the batch size is larger than the chunk size and not a multiple of chunk size.
+
+    :param f:
+        The function to be converted. The arguments of f are assumed to be sharded.
+
+    :param in_axes:
+        The vmapped axes of f which are to be chunked.
+
+    :param out_axes:
+        The vmapped axes of outputs.
+
+    :param chunk_size:
+        The chunk size on each machine.
+
+    :param use_scan:
+        Whether to use `jax.lax.scan` in chunked function apply. The compilation will be
+        accerlerated if `scan` is used, but the function must be jittable.
+    """
+    all_none = isinstance(in_axes, Sequence) and all(axis is None for axis in in_axes)
+    if in_axes is None or all_none or chunk_size is None:
+        return f  # fast return if chunk is not necessary
+
+    any_none = isinstance(out_axes, Sequence) and any(axis is None for axis in out_axes)
+    if out_axes is None or any_none:
+        raise NotImplementedError("`chunk_map` with `out_axes=None` not implemented")
+
+    def chunked_f(*args):
+        dynamic_args, static_args, device_batch = _chunk_args(args, in_axes, chunk_size)
+
+        if use_scan:
+            # Flatten dynamic_args to work with scan
+            dynamic_args_flat, treedef = jax.tree.flatten(dynamic_args)
+            nchunks = dynamic_args_flat[0].shape[0]
+            
+            # Get output from first chunk and use it as initial accumulator
+            first_args_list = [arg[0] for arg in dynamic_args_flat]
+            first_args = jax.tree.unflatten(treedef, first_args_list)
+            first_args = eqx.combine(first_args, static_args)
+            init_carry = f(*first_args)
+            
+            # Scan with accumulation - start from chunk 1 since chunk 0 is already in init_carry
+            def fn_scan(carry, i):
+                chunk_args_list = [arg[i] for arg in dynamic_args_flat]
+                chunk_args = jax.tree.unflatten(treedef, chunk_args_list)
+                chunk_args = eqx.combine(chunk_args, static_args)
+                output = f(*chunk_args)
+                # Add output to carry (only applies to arrays)
+                carry = filter_tree_map(lambda c, o: c + o, carry, output)
+                return carry, None
+            outputs, _ = jax.lax.scan(fn_scan, init_carry, jnp.arange(1, nchunks))
+        else:
+            dynamic_args, treedef = jax.tree.flatten(dynamic_args)
+            nchunks = dynamic_args[0].shape[0]
+            
+            # Get output from first chunk and use it as initial accumulator
+            first_args_list = [arg[0] for arg in dynamic_args]
+            first_args = jax.tree.unflatten(treedef, first_args_list)
+            first_args = eqx.combine(first_args, static_args)
+            outputs = f(*first_args)
+            
+            # Accumulate over remaining chunks (start from chunk 1)
+            for i in range(1, nchunks):
+                chunk_args_list = [arg[i] for arg in dynamic_args]
+                chunk_args = jax.tree.unflatten(treedef, chunk_args_list)
+                chunk_args = eqx.combine(chunk_args, static_args)
+                output = f(*chunk_args)
+                outputs = filter_tree_map(lambda c, o: c + o, outputs, output)
+
+        return outputs
+
+    return chunked_f
 
 def jit_chunk_vmap(
     f: Callable,
