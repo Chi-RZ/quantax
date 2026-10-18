@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import partial, wraps
 import jax
 import jax.numpy as jnp

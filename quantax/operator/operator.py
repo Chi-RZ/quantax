@@ -1227,8 +1227,10 @@ class Operator:
             Ovar:
                 Variance of the estimator, only returned when ``return_var = True``
         """
-        reweight = samples.reweight_factor if isinstance(samples, Samples) else 1.0
         Oloc = self.Oloc_transition(state1, state2, samples)
+        # the reweighting factor is updated in place by Oloc
+        r = samples.r if isinstance(samples, Samples) else None
+        reweight = 1.0 if r is None else r
         Omean = jnp.mean(Oloc * reweight)
         if return_var:
             Ovar = jnp.mean(jnp.abs(Oloc) ** 2 * reweight) - jnp.abs(Omean) ** 2
@@ -1261,8 +1263,10 @@ class Operator:
         :return:
             Mean (and optionally variance) of the transition estimator.
         """
-        reweight = samples.reweight_factor if isinstance(samples, Samples) else 1.0
         Oloc = self.Oloc_transition_withref(state_ref, state1, state2, samples)
+        # the reweighting factor is updated in place by Oloc
+        r = samples.r if isinstance(samples, Samples) else None
+        reweight = 1.0 if r is None else r
         Omean = jnp.mean(Oloc * reweight)
         if return_var:
             Ovar = jnp.mean(jnp.abs(Oloc) ** 2 * reweight) - jnp.abs(Omean) ** 2
@@ -1294,8 +1298,10 @@ class Operator:
         :return:
             Mean (and optionally variance) of the transition estimator.
         """
-        reweight = samples.reweight_factor if isinstance(samples, Samples) else 1.0
         Oloc = self.Oloc_transition_matrix_withref(state_ref, state, samples)
+        # the reweighting factor is updated in place by Oloc
+        r = samples.r if isinstance(samples, Samples) else None
+        reweight = 1.0 if r is None else r
         # w = reweight.reshape(-1, 1, 1, 1, 1)
         return Oloc
 
