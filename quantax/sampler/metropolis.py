@@ -143,6 +143,23 @@ class Metropolis(Sampler):
         """
         return self._use_ref
 
+    @property
+    def nan_proposals(self) -> tuple[int, int]:
+        """
+        The configuration-changing proposals of the last `sweep` (including the
+        thermalization sweep of `reset`) whose wave function was NaN, and all such
+        proposals evaluated, summed over the chains. A NaN proposal is always rejected,
+        so the chains never visit those configurations: this counts how often the
+        sampled distribution was cut by a non-finite wave function. ``(0, 0)`` before
+        any sweep.
+        """
+        n_nan = getattr(self, "_nan_proposals", None)
+        if n_nan is None:
+            return 0, 0
+        n_nan = np.asarray(to_replicated_array(n_nan)).sum()
+        n_prop = np.asarray(to_replicated_array(self._evaluated_proposals)).sum()
+        return int(n_nan), int(n_prop)
+
     def reset(
         self, nsweeps: int | None = None, initial_spins: jax.Array | None = None
     ) -> None:
@@ -219,10 +236,14 @@ class Metropolis(Sampler):
             fn_sweep = chunk_map(
                 self._partial_sweep, in_axes=(None, 0), chunk_size=chunk_size
             )
-            tree = fn_sweep(nsweeps, self._spins)
+            tree, n_nan, n_prop = fn_sweep(nsweeps, self._spins)
         else:
-            tree = self._partial_sweep(nsweeps, self._spins)
+            tree, n_nan, n_prop = self._partial_sweep(nsweeps, self._spins)
 
+        # per chain: the proposals of this sweep whose wave function was NaN (always
+        # rejected, see `_update`), and all configuration-changing proposals evaluated
+        self._nan_proposals = n_nan
+        self._evaluated_proposals = n_prop
         self._spins = tree.spins
         self._psi = tree.psi
         # the sampling probability |psi|^n in the LogArray representation, which
@@ -299,15 +320,18 @@ class Metropolis(Sampler):
             return SamplesTree(new_spins, new_psi, state_internal=state_internal)
 
         steps = to_distributed_array(jnp.zeros(spins.shape[0], jnp.int32))
+        n_nan = to_distributed_array(jnp.zeros(spins.shape[0], jnp.int32))
+        n_prop = to_distributed_array(jnp.zeros(spins.shape[0], jnp.int32))
         done = False
         while not done:
             key, new_spins, ratio, steps, done = self._propose_free_steps(
                 key, samples.spins, steps, nsweeps
             )
             new_samples = forward(new_spins, samples)
+            n_nan, n_prop = _count_nan_proposals(n_nan, n_prop, samples, new_samples)
             key, samples = self._update(key, ratio, samples, new_samples)
 
-        return SamplesTree(samples.spins, samples.psi)
+        return SamplesTree(samples.spins, samples.psi), n_nan, n_prop
 
     @eqx.filter_jit
     def _sweep_variational(
@@ -359,19 +383,23 @@ class Metropolis(Sampler):
             return ~done
 
         def round_body(carry):
-            key, samples, steps, done = carry
+            key, samples, steps, done, n_nan, n_prop = carry
             key, new_spins, ratio, steps, done = self._propose_free_steps(
                 key, samples.spins, steps, nsweeps
             )
             new_samples = forward(new_spins, samples)
+            n_nan, n_prop = _count_nan_proposals(n_nan, n_prop, samples, new_samples)
             key, samples = self._update(key, ratio, samples, new_samples)
-            return key, samples, steps, done
+            return key, samples, steps, done, n_nan, n_prop
 
         done = jnp.all(steps >= nsweeps)  # only for nsweeps <= 0
-        carry = (key, samples, steps, done)
-        key, samples, steps, done = jax.lax.while_loop(round_cond, round_body, carry)
+        zeros = jnp.zeros_like(steps)
+        carry = (key, samples, steps, done, zeros, zeros)
+        key, samples, steps, done, n_nan, n_prop = jax.lax.while_loop(
+            round_cond, round_body, carry
+        )
 
-        return SamplesTree(samples.spins, samples.psi)
+        return SamplesTree(samples.spins, samples.psi), n_nan, n_prop
 
     @eqx.filter_jit
     def _propose_free_steps(
@@ -710,3 +738,16 @@ class MixSampler(Metropolis):
         ratios = jnp.stack(ratios)
         ratio = jnp.take_along_axis(ratios, idx[None, :], axis=0)[0]
         return new_spins, ratio
+
+
+@jax.jit
+def _count_nan_proposals(
+    n_nan: jax.Array, n_prop: jax.Array, old: SamplesTree, new: SamplesTree
+) -> tuple[jax.Array, jax.Array]:
+    """
+    Add to the per-chain counters the configuration-changing proposals of this round,
+    and those of them whose wave function is NaN.
+    """
+    changed = jnp.any(old.spins != new.spins, axis=1)
+    bad = changed & isnan(new.psi).reshape(changed.shape)
+    return n_nan + bad.astype(n_nan.dtype), n_prop + changed.astype(n_prop.dtype)

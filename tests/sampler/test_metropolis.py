@@ -310,7 +310,7 @@ def test_chunked_direct_sweep_samples_target_distribution():
 
     def spy(nsweeps, spins):
         out = partial_sweep(nsweeps, spins)
-        outputs.append(np.asarray(out.spins))
+        outputs.append(np.asarray(out[0].spins))  # (samples, NaN and all proposals)
         return out
 
     mix._partial_sweep = spy
@@ -452,8 +452,10 @@ def test_low_precision_drops_sweep_psi_only_for_smaller_batches(monkeypatch):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             sampler = LocalFlip(state, NS, thermal_steps=0)
-            sampler._partial_sweep = lambda nsweeps, spins: SamplesTree(
-                spins, jnp.asarray(state(spins))
+            sampler._partial_sweep = lambda nsweeps, spins: (
+                SamplesTree(spins, jnp.asarray(state(spins))),
+                jnp.zeros(spins.shape[0], jnp.int32),
+                jnp.zeros(spins.shape[0], jnp.int32),
             )
             samples = sampler.sweep(1)
         assert dtypes in ([], [state.dtype])
@@ -933,3 +935,42 @@ def test_mixsampler_unifies_propose_ratios():
     est = float(np.mean(r * np.asarray(samples.spins)[:, 0]))
     # r * s0 has variance 0.72: sigma = 0.0067 for 16000 samples
     assert abs(est - exact_s0) < 0.035
+
+
+class _ExpLinearNanAt0(eqx.Module):
+    """psi(s) = exp(w . s), but NaN wherever mode 0 is occupied (s[0] > 0)."""
+
+    w: jax.Array
+
+    def __call__(self, s):
+        psi = jnp.exp(jnp.dot(self.w, s.astype(self.w.dtype)))
+        return jnp.where(s[0] > 0, jnp.nan, psi)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_nan_proposals_are_counted_and_never_visited(chunked):
+    # LocalFlip evaluates one configuration-changing proposal per chain and step, so
+    # the evaluated proposals are exactly nsamples * nsweeps. A flip of mode 0 from a
+    # chain with s[0] < 0 lands on NaN and is rejected; mode 0 is drawn with
+    # probability 1/L per step, and while s[0] < 0 every draw of it is a NaN proposal,
+    # so the count is Binomial(nsamples * nsweeps, 1/L): checked to 5 sigma. No chain
+    # ever has s[0] > 0, and the counters start at (0, 0) before any sweep.
+    L = 4
+    Chain(L, boundary=1)
+    w = jnp.asarray(np.linspace(-0.4, 0.6, L), jnp.float32)
+    kwargs = {"max_parallel": NS // NDEV // 2} if chunked else {}
+    state = Variational(_ExpLinearNanAt0(w), **kwargs)
+    if chunked:
+        assert state.forward_chunk is not None and state.forward_chunk < NS // NDEV
+    sampler = LocalFlip(state, NS, thermal_steps=0)
+    assert sampler.nan_proposals == (0, 0)
+    init = np.tile(np.asarray([-1, 1, -1, 1], np.int8), (NS, 1))
+    sampler.reset(nsweeps=0, initial_spins=jnp.asarray(init))
+    nsweeps = 200
+    samples = sampler.sweep(nsweeps)
+    n_nan, n_prop = sampler.nan_proposals
+    assert n_prop == NS * nsweeps
+    mean, sd = n_prop / L, np.sqrt(n_prop * (1 / L) * (1 - 1 / L))
+    assert abs(n_nan - mean) < 5 * sd, (n_nan, mean, sd)
+    assert np.all(np.asarray(samples.spins)[:, 0] < 0)
+    assert np.all(np.isfinite(np.asarray(samples.psi)))
